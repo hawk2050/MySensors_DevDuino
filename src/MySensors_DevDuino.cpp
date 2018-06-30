@@ -1,167 +1,121 @@
-/*
-* devduino-temp-hum-sensor.ino - Firmware for DevDuino v2.0 based temperature and humidity sensor Node with nRF24L01+ module
-*
-* Copyright 2014 Tomas Hozza <thozza@gmail.com>
-*
-* This program is free software; you can redistribute it and/or modify
-* it under the terms of the GNU General Public License as published by
-* the Free Software Foundation; either version 2 of the License.
-*
-* This program is distributed in the hope that it will be useful,
-* but WITHOUT ANY WARRANTY; without even the implied warranty of
-* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-* GNU General Public License for more details.
-*
-* You should have received a copy of the GNU General Public License
-* along with this program; if not, see <http://www.gnu.org/licenses/>.
-*
-* Authors:
-* Tomas Hozza <thozza@gmail.com>
-*
-* MySensors library - http://www.mysensors.org/
-* DevDuino v2.0 - http://www.seeedstudio.com/wiki/DevDuino_Sensor_Node_V2.0_(ATmega_328)
-* nRF24L01+ spec - https://www.sparkfun.com/datasheets/Wireless/Nordic/nRF24L01P_Product_Specification_1_0.pdf
-*
-Hardware Connections (Breakoutboard to Arduino):
- -VCC = 3.3V
- -GND = GND
- -SDA = A4 (use inline 10k resistor if your board is 5V)
- -SCL = A5 (use inline 10k resistor if your board is 5V)
 
- System clock is 16MHz
-
+/**
+ * The MySensors Arduino library handles the wireless radio link and protocol
+ * between your home built sensors/actuators and HA controller of choice.
+ * The sensors forms a self healing radio network with optional repeaters. Each
+ * repeater and gateway builds a routing tables in EEPROM which keeps track of the
+ * network topology allowing messages to be routed to nodes.
+ *
+ * Created by Henrik Ekblad <henrik.ekblad@mysensors.org>
+ * Copyright (C) 2013-2015 Sensnology AB
+ * Full contributor list: https://github.com/mysensors/Arduino/graphs/contributors
+ *
+ * Documentation: http://www.mysensors.org
+ * Support Forum: http://forum.mysensors.org
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * version 2 as published by the Free Software Foundation.
+ *
+ *******************************
+ *
+ * REVISION HISTORY
+ * Version 1.0: Henrik EKblad
+ * Version 1.1 - 2016-07-20: Converted to MySensors v2.0 and added various improvements - Torben Woltjen (mozzbozz)
+ * 
+ * DESCRIPTION
+ * This sketch implements a humidity/temperature
+ * sensor using a HTU21D connected via I2C to a V2.0 DevDuino
+ *  
+ * For more information, please visit:
+ * http://www.mysensors.org/build/humidity
+ * 
+ *  MySensors library - http://www.mysensors.org/
+ * DevDuino v2.0 - http://www.seeedstudio.com/wiki/DevDuino_Sensor_Node_V2.0_(ATmega_328)
+ * nRF24L01+ spec - https://www.sparkfun.com/datasheets/Wireless/Nordic/nRF24L01P_Product_Specification_1_0.pdf
+ * 
+ * System clock is 16MHz
  */
-#include <MySensor.h>
-#include <SPI.h>
+
+// Enable debug prints
+#define MY_DEBUG
+
+// Enable and select radio type attached 
+#define MY_RADIO_NRF24
+//#define MY_RADIO_RFM69
+//#define MY_RS485
+
+#define NODE_ID 5
+#define MY_RF24_CE_PIN 8
+#define MY_RF24_CS_PIN 7
+ 
+//#include <SPI.h>
+#include <MySensors.h> 
 #include <stdint.h>
-#include <math.h>
-
-
-#define API_v15
-
-
-#include <Wire.h>
-#include "HTU21D.h"
-
-// FORCE_TRANSMIT_INTERVAL, this number of times of wakeup, the sensor is forced to report all values to 
-// the controller
-#define FORCE_TRANSMIT_INTERVAL 3 
-#define SLEEP_TIME 300000
-#define MAX_ATTACHED_DS18B20 2
-
-//#define NODE_ID 5
-#define NODE_ID 6
-
-#define DEBUG_RCC 0
-
-#define MCP9700_ENABLE 0
-#define HTU21D_ENABLE 1
-
-enum sensor_id
-{
-  CHILD_ID_LIGHT = 0,
-  CHILD_ID_HTU21D_HUMIDITY,
-  CHILD_ID_HTU21D_TEMP,
-  CHILD_ID_DHT22_HUMIDITY,
-  CHILD_ID_DHT22_TEMP,
-  CHILD_ID_MCP9700_TEMP,
-  CHILD_ID_DALLAS_TEMP_BASE,
-  CHILD_ID_VOLTAGE = CHILD_ID_DALLAS_TEMP_BASE + MAX_ATTACHED_DS18B20
-  
-};
+#include <math.h> 
+#include "SparkFunHTU21D.h"
 
 
 
-/***********************************/
-/********* PIN DEFINITIONS *********/
-/***********************************/
-#define LED_pin 9
 
-// Data wire is plugged into port 3 on the Arduino
+// Sleep time between sensor updates (in milliseconds)
+static const uint64_t UPDATE_INTERVAL = 100000;
 
-#define RF24_CE_PIN 8
-#define RF24_CS_PIN 7
-#define MCP9700_PIN A3
-/*****************************/
-/********* FUNCTIONS *********/
-/*****************************/
-#if HTU21D_ENABLE
-//Create an instance of the object
-HTU21D myHumidity;
-MyMessage msgHum(CHILD_ID_HTU21D_HUMIDITY, V_HUM);
-MyMessage msgTemp(CHILD_ID_HTU21D_TEMP, V_TEMP);
-#endif
+// Force sending an update of the temperature after n sensor reads, so a controller showing the
+// timestamp of the last update doesn't show something like 3 hours in the unlikely case, that
+// the value didn't change since;
+// i.e. the sensor would force sending an update every UPDATE_INTERVAL*FORCE_UPDATE_N_READS [ms]
+static const uint8_t FORCE_UPDATE_N_READS = 3;
 
-#if MCP9700_ENABLE
-float readMCP9700Temp();
-MyMessage msgMCP9700Temp(CHILD_ID_MCP9700_TEMP, V_TEMP);
-#endif
+#define CHILD_ID_HUM 0
+#define CHILD_ID_TEMP 1
 
-uint16_t measureBattery();
+#define CHILD_ID_VOLTAGE 2
+
+float lastTemp;
+float lastHum;
+uint8_t nNoUpdatesTemp;
+uint8_t nNoUpdatesHum;
+bool metric = true;
+uint8_t loopCount = 0;
+uint8_t clockSwitchCount = 0;
+
+MyMessage msgHum(CHILD_ID_HUM, V_HUM);
+MyMessage msgTemp(CHILD_ID_TEMP, V_TEMP);
+HTU21D myHTU21D;
+
 MyMessage msgVolt(CHILD_ID_VOLTAGE, V_VOLTAGE); 
 
+uint16_t measureBattery(bool);
 uint8_t getBatteryPercent();
 uint16_t readVcc();
 void switchClock(unsigned char clk);
 bool highfreq = true;
 
-float lastTemperature;
-boolean receivedConfig = false;
-boolean metric = true; 
-uint8_t loopCount = 0;
-uint8_t clockSwitchCount = 0;
-/************************************/
-/********* GLOBAL VARIABLES *********/
-/************************************/
-#ifdef API_v15
-MyTransportNRF24 transport(RF24_CE_PIN, RF24_CS_PIN, RF24_PA_LEVEL);
-/*We're also tried to make the MySensors class hardware independent by introducing hardware profiles. 
- * They handle platform dependent things like sleeping, storage (EEPROM), watchdog, serial in- and output. 
- * Currently there is only one implementation for the ATMega328p (which also works fine for AtMega 2560)
- *Construct the class like this:
-  */
-MyHwATMega328 hw;
-MySensor node(transport,hw);
-#else
-MySensor node(RF24_CE_PIN, RF24_CS_PIN);
-#endif
+
+void presentation()  
+{ 
+  // Send the sketch version information to the gateway
+  sendSketchInfo("DevDuino-temp-humidity-sensor", "1.1");
+  
+  // Register all sensors to gw (they will be created as child devices)
+  present(CHILD_ID_HUM, S_HUM);
+  present(CHILD_ID_TEMP, S_TEMP);
+  present(CHILD_ID_VOLTAGE, S_CUSTOM);
+  
+  metric = getControllerConfig().isMetric;
+}
 
 
-
-/**********************************/
-/********* IMPLEMENTATION *********/
-/**********************************/
 void setup()
 {
-  
-  /*
-  ** Auto Node numbering
-  node.begin();
-  */
-  #ifdef NODE_ID
-  node.begin(NULL,NODE_ID,false);
-  #else
-  node.begin(NULL,AUTO,false);
-  #endif
-  
   analogReference(INTERNAL);
-  node.sendSketchInfo("devduino-temp-humidity-sensor", "0.4");
-  
-  node.present(CHILD_ID_VOLTAGE, S_CUSTOM);
-  // Register all sensors to gateway (they will be created as child devices)
-#if MCP9700_ENABLE
-  node.present(CHILD_ID_MCP9700_TEMP, S_TEMP);
-#endif
-
-#if HTU21D_ENABLE
-  myHumidity.begin();
-  node.present(CHILD_ID_HTU21D_HUMIDITY, S_HUM);
-  node.present(CHILD_ID_HTU21D_TEMP, S_TEMP);
-#endif
-  
+  myHTU21D.begin(); // set data pin of DHT sensor
 }
-void loop() 
-{
+
+
+void loop()      
+{  
   loopCount++;
   clockSwitchCount++;
   bool forceTransmit = false;
@@ -176,134 +130,89 @@ void loop()
       */
     switchClock(1<<CLKPS2); 
   }
-  
-  if (loopCount > FORCE_TRANSMIT_INTERVAL)
-  { // force a transmission
-    forceTransmit = true; 
-    loopCount = 0;
-  }
-  // Process incoming messages (like config from server)
-  node.process();
+
   measureBattery(forceTransmit);
   
-   
-  #if MCP9700_ENABLE
-  readMCP9700Temp();
-  #endif
-  
-  #if HTU21D_ENABLE
-  readHTU21DTemperature(forceTransmit);
-  readHTU21DHumidity(forceTransmit);  
-  #endif
-  
-  node.sleep(SLEEP_TIME);
-   
-  
+  // Get temperature from HTU21D library
+  float temperature = myHTU21D.readTemperature();
+
+  if (isnan(temperature))
+  {
+    Serial.println("Failed reading temperature from HTU21D!");
+  } 
+  else if (temperature != lastTemp || nNoUpdatesTemp == FORCE_UPDATE_N_READS)
+  {
+    // Only send temperature if it changed since the last measurement or if we didn't send an update for n times
+    lastTemp = temperature;
+
+    // Reset no updates counter
+    nNoUpdatesTemp = 0;
+    send(msgTemp.set(temperature, 1));
+
+    #ifdef MY_DEBUG
+    Serial.print("T: ");
+    Serial.println(temperature);
+    #endif
+  } 
+  else
+  {
+    // Increase no update counter if the temperature stayed the same
+    nNoUpdatesTemp++;
+  }
+
+  // Get humidity from HTU21D library
+  float humidity = myHTU21D.readHumidity();
+  if (isnan(humidity))
+  {
+    Serial.println("Failed reading humidity from HTU21D");
+  }
+  else if (humidity != lastHum || nNoUpdatesHum == FORCE_UPDATE_N_READS)
+  {
+    // Only send humidity if it changed since the last measurement or if we didn't send an update for n times
+    lastHum = humidity;
+    // Reset no updates counter
+    nNoUpdatesHum = 0;
+    send(msgHum.set(humidity, 1));
+    
+    #ifdef MY_DEBUG
+    Serial.print("H: ");
+    Serial.println(humidity);
+    #endif
+  }
+  else
+  {
+    // Increase no update counter if the humidity stayed the same
+    nNoUpdatesHum++;
+  }
+
+  // Sleep for a while to save energy
+  sleep(UPDATE_INTERVAL); 
 }
 
-#if HTU21D_ENABLE
-void readHTU21DTemperature(bool force)
-{
-  static float lastTemp = 0;
-  
-  if (force)
-  {
-   lastTemperature = -100;
-  }
-  float temp = myHumidity.readTemperature();
-  
-  if(lastTemp != temp)
-  {
-    node.send(msgTemp.set(temp,1));
-    lastTemp = temp;
-  }
-}
-
-void readHTU21DHumidity(bool force)
-{
-  static float lastHumidity = 0;
-  
-  if (force) 
-  {
-    lastHumidity = -100;
-  }
-  float humd = myHumidity.readHumidity();
-  
-  if(lastHumidity != humd)
-  {
-    node.send(msgHum.set(humd,1));
-    lastHumidity = humd;
-  }
-}
-#endif
-
-
-
+    
 /**
-* Read the temperature from MCP9700
+* Measure remaining voltage in battery in millivolts
+*
+* From http://www.seeedstudio.com/wiki/DevDuino_Sensor_Node_V2.0_(ATmega_328)#Measurement_voltage_power
 */
-
-#if MCP9700_ENABLE
-float readMCP9700Temp() 
-{
-
-static float lastTemp = -200.0;
-  float temp = analogRead(MCP9700_PIN)*3.3/1024.0;
-  temp = temp - 0.5;
-  temp = temp / 0.01;
-  #if DEBUG_RCC
-  Serial.print("Read Temp from MCP9700 = ");
-  Serial.println(temp);
-  Serial.println('\r');
-  #endif
-  if (temp != lastTemp || loopCount == 0)
-  {
-    node.send(msgMCP9700Temp.set(temp, 1));
-    lastTemp = temp;
-  }
-  return temp;
-  
-}
-#endif
-/**
-* Get the percentage of power in the battery
-*/
-uint8_t getBatteryPercent()
-{
-  static const float full_battery_v = 3169.0;
-  float level = readVcc() / full_battery_v;
-  uint8_t percent = level * 100;
-  #if DEBUG_RCC
-  Serial.print("Battery state = ");
-  Serial.println(percent);
-  Serial.println('\r');
-  #endif
-  node.sendBatteryLevel(percent);
-  return percent;
-}
-
 uint16_t measureBattery(bool force)
 {
   static uint16_t lastVcc = 0;
   
-  if (force) {
+  if (force)
+  {
     lastVcc = 0;
   }
   
   uint16_t thisVcc = readVcc();
   if(thisVcc != lastVcc || loopCount == 0)
   {
-    node.send(msgVolt.set(readVcc(), 1));
+    send(msgVolt.set(readVcc(), 1));
     lastVcc = thisVcc;
   }
   return thisVcc;
   
 }
-/**
-* Measure remaining voltage in battery in millivolts
-*
-* From http://www.seeedstudio.com/wiki/DevDuino_Sensor_Node_V2.0_(ATmega_328)#Measurement_voltage_power
-*/
 
 uint16_t readVcc()
 {
@@ -343,4 +252,3 @@ void switchClock(unsigned char clk)
   sei();
   highfreq = false;
 }
-
