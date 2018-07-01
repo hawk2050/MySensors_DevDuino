@@ -45,9 +45,15 @@
 //#define MY_RADIO_RFM69
 //#define MY_RS485
 
-#define NODE_ID 5
+/*Makes this static so won't try and find another parent if communication with
+ gateway fails*/
+#define MY_PARENT_NODE_ID 0
+#define MY_PARENT_NODE_IS_STATIC
+
+#define MY_NODE_ID 5
 #define MY_RF24_CE_PIN 8
 #define MY_RF24_CS_PIN 7
+#define MY_RF24_CHANNEL 100
  
 //#include <SPI.h>
 #include <MySensors.h> 
@@ -93,6 +99,28 @@ void switchClock(unsigned char clk);
 bool highfreq = true;
 
 
+/**********************************/
+/********* IMPLEMENTATION *********/
+/**********************************/
+/*If you need to do initialization before the MySensors library starts up,
+define a before() function */
+void before()
+{
+
+}
+
+/*To handle received messages, define the following function in your sketch*/
+void receive(const MyMessage &message)
+{
+  /*Handle incoming message*/
+}
+
+/* If your node requests time using requestTime(). The following function is
+used to pick up the response*/
+void receiveTime(unsigned long ts)
+{
+}
+
 void presentation()  
 { 
   // Send the sketch version information to the gateway
@@ -106,7 +134,8 @@ void presentation()
   metric = getControllerConfig().isMetric;
 }
 
-
+/*You can still use setup() which is executed AFTER mysensors has been
+initialised.*/
 void setup()
 {
   analogReference(INTERNAL);
