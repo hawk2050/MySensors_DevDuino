@@ -50,55 +50,78 @@
 #define MY_PARENT_NODE_ID 0
 #define MY_PARENT_NODE_IS_STATIC
 
-#define MY_NODE_ID 5
+/**
+ * @def MY_TRANSPORT_WAIT_READY_MS
+ * @brief Timeout in ms until transport is ready during startup, set to 0 for no timeout
+ */
+#define MY_TRANSPORT_WAIT_READY_MS (1000)
+
+#define MY_NODE_ID 6
 #define MY_RF24_CE_PIN 8
 #define MY_RF24_CS_PIN 7
 #define MY_RF24_CHANNEL 100
  
-//#include <SPI.h>
 #include <MySensors.h> 
 #include <stdint.h>
 #include <math.h> 
 #include "SparkFunHTU21D.h"
+#include <BatterySense.hpp>
 
-
+#define TEMP_HUM_SENSOR 1
 
 
 // Sleep time between sensor updates (in milliseconds)
-static const uint64_t UPDATE_INTERVAL = 100000;
+static const uint32_t DAY_UPDATE_INTERVAL_MS = 10000;
 
 // Force sending an update of the temperature after n sensor reads, so a controller showing the
 // timestamp of the last update doesn't show something like 3 hours in the unlikely case, that
 // the value didn't change since;
 // i.e. the sensor would force sending an update every UPDATE_INTERVAL*FORCE_UPDATE_N_READS [ms]
-static const uint8_t FORCE_UPDATE_N_READS = 3;
+//static const uint8_t FORCE_UPDATE_N_READS = 3;
 
-#define CHILD_ID_HUM 0
-#define CHILD_ID_TEMP 1
-
-#define CHILD_ID_VOLTAGE 2
+enum child_id_t
+{
+  CHILD_ID_HUMIDITY,
+  CHILD_ID_TEMP,
+  CHILD_ID_UV,
+  CHILD_ID_VOLTAGE
+};
 
 float lastTemp;
 float lastHum;
-uint8_t nNoUpdatesTemp;
-uint8_t nNoUpdatesHum;
-bool metric = true;
+
 uint8_t loopCount = 0;
 uint8_t clockSwitchCount = 0;
 
-MyMessage msgHum(CHILD_ID_HUM, V_HUM);
-MyMessage msgTemp(CHILD_ID_TEMP, V_TEMP);
+/*****************************/
+/****** Sensor Objects *******/
+/*****************************/
+
+//Create an instance of the sensor objects
+#if UV_SENSOR
+const char sketchString[] = "mys_v11-uv";
+UVSensor UV(MY_UVIS25_POWER_PIN); //Ultraviolet sensor
+MyMessage msgUVindex(CHILD_ID_UV, V_UV);
+
+#endif
+
+#if TEMP_HUM_SENSOR
+const char sketchString[] = "devDuino-temp_humid";
 HTU21D myHTU21D;
+MyMessage msgHum(CHILD_ID_HUMIDITY, V_HUM);
+MyMessage msgTemp(CHILD_ID_TEMP, V_TEMP);
+void readHTU21DTemperature(bool force);
+void readHTU21DHumidity(bool force);
+#endif
 
-MyMessage msgVolt(CHILD_ID_VOLTAGE, V_VOLTAGE); 
-
-uint16_t measureBattery(bool);
-uint8_t getBatteryPercent();
-uint16_t readVcc();
+MyMessage msgVolt(CHILD_ID_VOLTAGE, V_VOLTAGE);
 void switchClock(unsigned char clk);
-bool highfreq = true;
 
+/*Set true to have clock throttle back, or false to not throttle*/
+bool throttlefreq = true;
+bool cpu_is_throttled = false;
 
+BatteryLevel batt;
 /**********************************/
 /********* IMPLEMENTATION *********/
 /**********************************/
@@ -121,156 +144,99 @@ void receiveTime(unsigned long ts)
 {
 }
 
-void presentation()  
-{ 
-  // Send the sketch version information to the gateway
-  sendSketchInfo("DevDuino-temp-humidity-sensor", "1.1");
-  
-  // Register all sensors to gw (they will be created as child devices)
-  present(CHILD_ID_HUM, S_HUM);
-  present(CHILD_ID_TEMP, S_TEMP);
-  present(CHILD_ID_VOLTAGE, S_CUSTOM);
-  
-  metric = getControllerConfig().isMetric;
-}
-
 /*You can still use setup() which is executed AFTER mysensors has been
 initialised.*/
 void setup()
 {
-  analogReference(INTERNAL);
-  myHTU21D.begin(); // set data pin of DHT sensor
+  
+  Wire.begin();
+  #if UV_SENSOR
+  UV.init();
+  #endif
+  #if TEMP_HUM_SENSOR
+  myHTU21D.begin();
+  #endif
+  Serial.begin(9600);
+  
+}
+
+void presentation()
+{
+   // Send the sketch version information to the gateway and Controller
+  sendSketchInfo(sketchString, "0.6");
+  // Register all sensors to gateway (they will be created as child devices)
+  present(CHILD_ID_VOLTAGE, S_MULTIMETER);
+
+#if UV_SENSOR
+  present(CHILD_ID_UV, S_UV);
+#endif
+
+#if TEMP_HUM_SENSOR
+  present(CHILD_ID_HUMIDITY, S_HUM);
+  present(CHILD_ID_TEMP, S_TEMP);
+#endif
+   
 }
 
 
-void loop()      
-{  
-  loopCount++;
+void loop()
+{
+
+  uint32_t update_interval_ms = DAY_UPDATE_INTERVAL_MS;
+
   clockSwitchCount++;
-  bool forceTransmit = false;
+  #if DEBUG_RCC
+  Serial.print("clockSwitchCount = ");
+  Serial.print(clockSwitchCount,DEC);
+  Serial.println();
+  #endif
   
-  // When we wake up the 5th time after power on, switch to 1Mhz clock
-  // This allows us to print debug messages on startup (as serial port is dependend on oscilator settings).
-  if ( (clockSwitchCount == 5) && highfreq)
+  // When we wake up the 5th time after power on, switch to 4Mhz clock
+  // This allows us to print debug messages on startup (as serial port is dependent on oscillator settings).
+  if ( (clockSwitchCount == 5) && throttlefreq)
   {
-    /* Switch to 1Mhz by setting clock prescaler to divide by 16 for the reminder of the sketch, 
+    /* Switch to 4Mhz by setting clock prescaler to divide by 2 for the reminder of the sketch, 
      * to save power but more importantly to allow operation down to 1.8V
      * 
       */
-    switchClock(1<<CLKPS2); 
-  }
-
-  measureBattery(forceTransmit);
-  
-  // Get temperature from HTU21D library
-  float temperature = myHTU21D.readTemperature();
-
-  if (isnan(temperature))
-  {
-    Serial.println("Failed reading temperature from HTU21D!");
-  } 
-  else if (temperature != lastTemp || nNoUpdatesTemp == FORCE_UPDATE_N_READS)
-  {
-    // Only send temperature if it changed since the last measurement or if we didn't send an update for n times
-    lastTemp = temperature;
-
-    // Reset no updates counter
-    nNoUpdatesTemp = 0;
-    send(msgTemp.set(temperature, 1));
-
-    #ifdef MY_DEBUG
-    Serial.print("T: ");
-    Serial.println(temperature);
-    #endif
-  } 
-  else
-  {
-    // Increase no update counter if the temperature stayed the same
-    nNoUpdatesTemp++;
-  }
-
-  // Get humidity from HTU21D library
-  float humidity = myHTU21D.readHumidity();
-  if (isnan(humidity))
-  {
-    Serial.println("Failed reading humidity from HTU21D");
-  }
-  else if (humidity != lastHum || nNoUpdatesHum == FORCE_UPDATE_N_READS)
-  {
-    // Only send humidity if it changed since the last measurement or if we didn't send an update for n times
-    lastHum = humidity;
-    // Reset no updates counter
-    nNoUpdatesHum = 0;
-    send(msgHum.set(humidity, 1));
     
-    #ifdef MY_DEBUG
-    Serial.print("H: ");
-    Serial.println(humidity);
+    #if DEBUG_RCC
+    Serial.print("Setting CPU Freq to 4MHz");
+    Serial.println();
     #endif
-  }
-  else
-  {
-    // Increase no update counter if the humidity stayed the same
-    nNoUpdatesHum++;
-  }
+    switchClock(0x02); // divide by 4, to give 4MHz on 16MHz, 3V3 Pro Mini
+    cpu_is_throttled = true;
+    throttlefreq = false;
+  } //end if
 
-  // Sleep for a while to save energy
-  sleep(UPDATE_INTERVAL); 
-}
+  uint16_t battLevel = batt.getVoltage();
+  send(msgVolt.set(battLevel,1));
 
-    
-/**
-* Measure remaining voltage in battery in millivolts
-*
-* From http://www.seeedstudio.com/wiki/DevDuino_Sensor_Node_V2.0_(ATmega_328)#Measurement_voltage_power
-*/
-uint16_t measureBattery(bool force)
-{
-  static uint16_t lastVcc = 0;
-  
-  if (force)
-  {
-    lastVcc = 0;
-  }
-  
-  uint16_t thisVcc = readVcc();
-  if(thisVcc != lastVcc || loopCount == 0)
-  {
-    send(msgVolt.set(readVcc(), 1));
-    lastVcc = thisVcc;
-  }
-  return thisVcc;
-  
-}
+#if TEMP_HUM_SENSOR
+  readHTU21DTemperature(true);
+  readHTU21DHumidity(true);
+#endif
 
-uint16_t readVcc()
-{
-  // Read 1.1V reference against AVcc
-  // set the reference to Vcc and the measurement to the internal 1.1V reference
-  #if defined(__AVR_ATmega32U4__) || defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__)
-  ADMUX = _BV(REFS0) | _BV(MUX4) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
-  #elif defined (__AVR_ATtiny24__) || defined(__AVR_ATtiny44__) || defined(__AVR_ATtiny84__)
-  ADMUX = _BV(MUX5) | _BV(MUX0);
-  #elif defined (__AVR_ATtiny25__) || defined(__AVR_ATtiny45__) || defined(__AVR_ATtiny85__)
-  ADMUX = _BV(MUX3) | _BV(MUX2);
-  #else
-  ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
-  #endif
-  delay(75); // Wait for Vref to settle
-  ADCSRA |= _BV(ADSC); // Start conversion
-  while (bit_is_set(ADCSRA,ADSC)); // measuring
-  uint8_t low = ADCL; // must read ADCL first - it then locks ADCH
-  uint8_t high = ADCH; // unlocks both
-  long result = (high<<8) | low;
-  result = 1125300L / result; // Calculate Vcc (in mV); 1125300 = 1.1*1023*1000
-  #if DEBUG_RCC
-  Serial.print("Read Vcc = ");
-  Serial.println(result);
-  Serial.println('\r');
-  #endif
-  return (uint16_t)result; // Vcc in millivolts
+#if UV_SENSOR
+  UV.read_sensor();
+
+#if DEBUG_RCC
+    Serial.print("UV reading is :");
+    Serial.print(UV.get_uvi(), 1);
+    Serial.println();
+#endif
   
-}
+  send(msgUVindex.set(UV.get_uvi(),1));
+#if DEBUG_RCC
+    Serial.print("Power down UV sensor");
+    Serial.println();
+#endif
+#endif /*UV_SENSOR*/
+
+  sleep(update_interval_ms); 
+  
+  
+} //end loop
 
 void switchClock(unsigned char clk)
 {
@@ -279,5 +245,54 @@ void switchClock(unsigned char clk)
   CLKPR = 1<<CLKPCE; // Set CLKPCE to enable clk switching
   CLKPR = clk;  
   sei();
-  highfreq = false;
+  
 }
+
+#if TEMP_HUM_SENSOR
+void readHTU21DTemperature(bool force)
+{
+  static float lastTemp = 0;
+
+  if (force)
+  {
+   lastTemp = -100;
+  }
+  float temp = myHTU21D.readTemperature();
+
+  if(lastTemp != temp)
+  {
+    send(msgTemp.set(temp,1));
+    lastTemp = temp;
+    #ifdef DEBUG_RCC
+    Serial.print(" Temperature:");
+    Serial.print(temp, 1);
+    Serial.print("C");
+    Serial.println();
+    #endif
+  }
+}
+
+void readHTU21DHumidity(bool force)
+{
+  static float lastHumidity = 0;
+
+  if (force)
+  {
+    lastHumidity = -100;
+  }
+  float humd = myHTU21D.readHumidity();
+
+  if(lastHumidity != humd)
+  {
+    send(msgHum.set(humd,1));
+    lastHumidity = humd;
+    #ifdef DEBUG_RCC
+    Serial.print(" Humidity:");
+    Serial.print(humd, 1);
+    Serial.print("%");
+    Serial.println();
+    #endif
+  }
+}
+
+#endif
